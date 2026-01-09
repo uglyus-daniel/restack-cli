@@ -1,0 +1,22 @@
+{
+  "name": "restack",
+  "version": "1.0.0",
+  "description": "Git 커밋을 PR 단위로 재정렬하는 CLI 도구",
+  "bin": {
+    "restack": "./bin/restack"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "git",
+    "restack",
+    "cherry-pick",
+    "pr"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

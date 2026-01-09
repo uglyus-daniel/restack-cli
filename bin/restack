@@ -1,0 +1,377 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# 색상 정의
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# 임시 브랜치 prefix
+TEMP_PREFIX="RESTACK-"
+
+# 인자 확인
+if [ $# -lt 2 ]; then
+  echo -e "${RED}❌ 사용법: restack <start-commit> <end-commit> [base-branch]${NC}"
+  echo -e "${YELLOW}예시: restack 938fa82e f80ce55b origin/feature/anytime${NC}"
+  exit 1
+fi
+
+START_COMMIT="$1"
+END_COMMIT="$2"
+BASE_BRANCH="${3:-origin/feature/anytime}"
+
+# 현재 브랜치 저장
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+echo -e "${BLUE}📌 현재 브랜치: ${CURRENT_BRANCH}${NC}"
+
+# 프로젝트 루트 찾기 (uglyus-web 디렉토리)
+PROJECT_ROOT=$(git rev-parse --show-toplevel)
+WEB_DIR="${PROJECT_ROOT}/uglyus-web"
+
+if [ ! -d "$WEB_DIR" ]; then
+  echo -e "${RED}❌ uglyus-web 디렉토리를 찾을 수 없습니다.${NC}"
+  exit 1
+fi
+
+# 원격 브랜치인 경우 fetch
+if [[ "$BASE_BRANCH" == origin/* ]]; then
+  REMOTE_BRANCH="${BASE_BRANCH#origin/}"
+  echo -e "${BLUE}🔄 원격 브랜치 fetch 중...${NC}"
+  git fetch origin "${REMOTE_BRANCH}" || {
+    echo -e "${RED}❌ fetch 실패: origin/${REMOTE_BRANCH}${NC}"
+    exit 1
+  }
+fi
+
+# 커밋 범위 가져오기 (start부터 end까지, 포함)
+echo -e "${BLUE}📋 커밋 범위 확인 중...${NC}"
+
+COMMITS=$(git rev-list --reverse "${START_COMMIT}^..${END_COMMIT}" 2>/dev/null || echo "")
+
+if [ -z "$COMMITS" ]; then
+  COMMITS=$(git rev-list --reverse "${START_COMMIT}..${END_COMMIT}" 2>/dev/null || echo "")
+  if [ -n "$COMMITS" ]; then
+    COMMITS="${START_COMMIT}"$'\n'"${COMMITS}"
+  else
+    COMMITS="${START_COMMIT}"
+  fi
+fi
+
+if [ -z "$COMMITS" ]; then
+  echo -e "${RED}❌ 지정된 커밋 범위를 찾을 수 없습니다.${NC}"
+  echo -e "${YELLOW}💡 커밋 해시가 올바른지 확인해주세요.${NC}"
+  exit 1
+fi
+
+COMMIT_COUNT=$(echo "$COMMITS" | wc -l | tr -d ' ')
+echo -e "${GREEN}✅ ${COMMIT_COUNT}개의 커밋을 발견했습니다.${NC}"
+
+# 각 커밋에 연결된 브랜치 찾기 함수
+find_branch_for_commit() {
+  local commit="$1"
+  local branch=$(git branch --list --format='%(refname:short)' --points-at "$commit" 2>/dev/null | head -n1)
+  echo "$branch"
+}
+
+# 타입 검사 함수
+run_typecheck() {
+  local branch_name="$1"
+  echo -e "\n${BLUE}🔍 타입 검사 중... (${branch_name})${NC}"
+  
+  cd "$WEB_DIR"
+  
+  if npx tsc --noEmit 2>&1; then
+    echo -e "${GREEN}   ✅ 타입 검사 통과${NC}"
+    cd "$PROJECT_ROOT"
+    return 0
+  else
+    echo -e "${RED}   ❌ 타입 검사 실패!${NC}"
+    cd "$PROJECT_ROOT"
+    return 1
+  fi
+}
+
+# 임시 브랜치를 원래 브랜치로 rename하는 함수
+rename_temp_to_final() {
+  local temp_branch="$1"
+  local final_branch="$2"
+  
+  # 기존 브랜치 삭제 (있으면)
+  if git rev-parse --verify "$final_branch" >/dev/null 2>&1; then
+    git branch -D "$final_branch" >/dev/null 2>&1 || true
+  fi
+  
+  # 임시 브랜치를 최종 브랜치로 rename
+  git branch -m "$temp_branch" "$final_branch"
+}
+
+# PR 범위 분석: 브랜치가 있는 커밋을 기준으로 그룹화
+echo -e "\n${BLUE}🔍 PR 범위 분석 중...${NC}"
+
+declare -a ALL_COMMITS=()
+declare -a PR_BRANCHES=()
+declare -a PR_END_INDICES=()
+
+# 모든 커밋을 배열에 저장
+while IFS= read -r commit; do
+  ALL_COMMITS+=("$commit")
+done <<< "$COMMITS"
+
+# 브랜치가 있는 커밋 찾기 (PR 경계)
+for i in "${!ALL_COMMITS[@]}"; do
+  commit="${ALL_COMMITS[$i]}"
+  BRANCH_NAME=$(find_branch_for_commit "$commit")
+  
+  if [ -n "$BRANCH_NAME" ]; then
+    PR_BRANCHES+=("$BRANCH_NAME")
+    PR_END_INDICES+=("$i")
+  fi
+done
+
+# PR 범위가 없으면 에러
+if [ ${#PR_BRANCHES[@]} -eq 0 ]; then
+  echo -e "${RED}❌ 브랜치가 연결된 커밋을 찾을 수 없습니다.${NC}"
+  echo -e "${YELLOW}💡 각 PR의 마지막 커밋에 로컬 브랜치가 있어야 합니다.${NC}"
+  exit 1
+fi
+
+# PR 범위 출력
+echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}📚 발견된 PR 범위:${NC}"
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+PR_START_INDEX=0
+for pr_idx in "${!PR_BRANCHES[@]}"; do
+  PR_END_INDEX="${PR_END_INDICES[$pr_idx]}"
+  BRANCH_NAME="${PR_BRANCHES[$pr_idx]}"
+  COMMIT_COUNT_IN_PR=$((PR_END_INDEX - PR_START_INDEX + 1))
+  
+  START_COMMIT_SHORT=$(git rev-parse --short "${ALL_COMMITS[$PR_START_INDEX]}")
+  END_COMMIT_SHORT=$(git rev-parse --short "${ALL_COMMITS[$PR_END_INDEX]}")
+  
+  if [ $COMMIT_COUNT_IN_PR -eq 1 ]; then
+    echo -e "${CYAN}  ${BRANCH_NAME}${NC} ← ${END_COMMIT_SHORT} (1 커밋)"
+  else
+    echo -e "${CYAN}  ${BRANCH_NAME}${NC} ← ${START_COMMIT_SHORT} ~ ${END_COMMIT_SHORT} (${COMMIT_COUNT_IN_PR} 커밋)"
+  fi
+  
+  PR_START_INDEX=$((PR_END_INDEX + 1))
+done
+
+# Re-stack 계획 출력
+echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}📚 Re-stack 계획:${NC}"
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BLUE}Base: ${BASE_BRANCH}${NC}"
+
+for pr_idx in "${!PR_BRANCHES[@]}"; do
+  BRANCH_NAME="${PR_BRANCHES[$pr_idx]}"
+  if [ $pr_idx -eq 0 ]; then
+    echo -e "  └─ ${CYAN}${BRANCH_NAME}${NC}"
+  else
+    echo -e "      $( printf '%*s' $((pr_idx*4)) '' )└─ ${CYAN}${BRANCH_NAME}${NC}"
+  fi
+done
+
+echo -e "\n${YELLOW}⚠️  위 계획대로 진행하시겠습니까? (y/n)${NC}"
+read -p "선택: " confirm_choice
+if [ "$confirm_choice" != "y" ] && [ "$confirm_choice" != "Y" ]; then
+  echo -e "${YELLOW}🛑 작업이 취소되었습니다.${NC}"
+  exit 0
+fi
+
+# Re-stack 실행
+echo -e "\n${BLUE}🚀 Re-stack 시작...${NC}"
+echo -e "${YELLOW}💡 임시 브랜치 prefix: ${TEMP_PREFIX}${NC}"
+
+PREVIOUS_TEMP_BRANCH=""
+declare -a TEMP_BRANCHES=()
+declare -a FINAL_BRANCHES=()
+PR_START_INDEX=0
+
+for pr_idx in "${!PR_BRANCHES[@]}"; do
+  PR_END_INDEX="${PR_END_INDICES[$pr_idx]}"
+  FINAL_BRANCH_NAME="${PR_BRANCHES[$pr_idx]}"
+  TEMP_BRANCH_NAME="${TEMP_PREFIX}${FINAL_BRANCH_NAME}"
+  
+  echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  echo -e "${BLUE}[PR $(($pr_idx + 1))/${#PR_BRANCHES[@]}] ${FINAL_BRANCH_NAME}${NC}"
+  echo -e "${YELLOW}   임시 브랜치: ${TEMP_BRANCH_NAME}${NC}"
+  echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+  
+  # 기존 임시 브랜치 삭제 (있으면)
+  if git rev-parse --verify "$TEMP_BRANCH_NAME" >/dev/null 2>&1; then
+    echo -e "${YELLOW}   기존 임시 브랜치 ${TEMP_BRANCH_NAME} 삭제 중...${NC}"
+    git branch -D "$TEMP_BRANCH_NAME" >/dev/null 2>&1 || true
+  fi
+  
+  # 새 임시 브랜치 생성
+  if [ $pr_idx -eq 0 ]; then
+    echo -e "${BLUE}   ${BASE_BRANCH}에서 ${TEMP_BRANCH_NAME} 생성...${NC}"
+    git checkout -b "$TEMP_BRANCH_NAME" "$BASE_BRANCH" || {
+      echo -e "${RED}❌ 브랜치 생성 실패${NC}"
+      exit 1
+    }
+  else
+    echo -e "${BLUE}   ${PREVIOUS_TEMP_BRANCH}에서 ${TEMP_BRANCH_NAME} 생성...${NC}"
+    git checkout -b "$TEMP_BRANCH_NAME" "$PREVIOUS_TEMP_BRANCH" || {
+      echo -e "${RED}❌ 브랜치 생성 실패${NC}"
+      exit 1
+    }
+  fi
+  
+  # 해당 PR 범위의 모든 커밋을 cherry-pick
+  for commit_idx in $(seq $PR_START_INDEX $PR_END_INDEX); do
+    commit="${ALL_COMMITS[$commit_idx]}"
+    COMMIT_SHORT=$(git rev-parse --short "$commit")
+    COMMIT_MSG=$(git log -1 --format="%s" "$commit" 2>/dev/null || echo "")
+    
+    echo -e "${BLUE}   Cherry-picking ${COMMIT_SHORT}...${NC}"
+    echo -e "${YELLOW}      ${COMMIT_MSG:0:60}${NC}"
+    
+    if git cherry-pick "$commit"; then
+      echo -e "${GREEN}      ✅ 성공${NC}"
+    else
+      echo -e "${RED}      ❌ 충돌 발생!${NC}"
+      
+      # 충돌 해결 루프
+      while true; do
+        echo -e "\n${YELLOW}⚠️  충돌이 발생했습니다. 어떻게 진행하시겠습니까?${NC}"
+        echo -e "${YELLOW}   1) 충돌 해결 후 계속 (git cherry-pick --continue)${NC}"
+        echo -e "${YELLOW}   2) 이 커밋 스킵 (git cherry-pick --skip)${NC}"
+        echo -e "${YELLOW}   3) 전체 작업 중단 (git cherry-pick --abort)${NC}"
+        read -p "선택 (1/2/3): " choice
+        
+        case $choice in
+          1)
+            echo -e "${BLUE}💡 충돌을 해결하세요. 완료되면 Enter를 누르세요.${NC}"
+            echo -e "${YELLOW}   현재 브랜치: ${TEMP_BRANCH_NAME}${NC}"
+            read -p "충돌 해결 완료 후 Enter: "
+            
+            # cherry-pick --continue 실행
+            if git cherry-pick --continue; then
+              echo -e "${GREEN}      ✅ cherry-pick --continue 성공${NC}"
+              break
+            else
+              echo -e "${RED}      ❌ cherry-pick --continue 실패. 다시 시도하세요.${NC}"
+              # 루프 계속
+            fi
+            ;;
+          2)
+            echo -e "${YELLOW}⏭️  커밋 스킵 중...${NC}"
+            git cherry-pick --skip || {
+              echo -e "${RED}❌ 스킵 실패${NC}"
+              exit 1
+            }
+            echo -e "${GREEN}      ✅ 커밋 스킵됨${NC}"
+            break
+            ;;
+          3)
+            echo -e "${YELLOW}🛑 전체 작업 중단 중...${NC}"
+            git cherry-pick --abort 2>/dev/null || true
+            
+            # 생성된 임시 브랜치들 정리
+            echo -e "${YELLOW}🧹 임시 브랜치 정리 중...${NC}"
+            git checkout "${CURRENT_BRANCH}" 2>/dev/null || git checkout "$BASE_BRANCH" || true
+            for temp_br in "${TEMP_BRANCHES[@]}"; do
+              git branch -D "$temp_br" 2>/dev/null || true
+            done
+            git branch -D "$TEMP_BRANCH_NAME" 2>/dev/null || true
+            
+            echo -e "${RED}❌ 작업이 중단되었습니다.${NC}"
+            exit 1
+            ;;
+          *)
+            echo -e "${RED}❌ 잘못된 선택입니다. 다시 선택하세요.${NC}"
+            # 루프 계속
+            ;;
+        esac
+      done
+    fi
+  done
+  
+  # 타입 검사 실행
+  if ! run_typecheck "$TEMP_BRANCH_NAME"; then
+    echo -e "\n${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${RED}❌ 타입 검사 실패로 작업이 중단되었습니다.${NC}"
+    echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}💡 현재 브랜치: ${TEMP_BRANCH_NAME}${NC}"
+    echo -e "${YELLOW}💡 타입 오류를 수정한 후 다시 시도하세요.${NC}"
+    exit 1
+  fi
+  
+  TEMP_BRANCHES+=("$TEMP_BRANCH_NAME")
+  FINAL_BRANCHES+=("$FINAL_BRANCH_NAME")
+  PREVIOUS_TEMP_BRANCH="$TEMP_BRANCH_NAME"
+  PR_START_INDEX=$((PR_END_INDEX + 1))
+done
+
+# 모든 작업 완료 - 임시 브랜치를 최종 브랜치로 rename
+echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${BLUE}🔄 임시 브랜치를 최종 브랜치로 변환 중...${NC}"
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+# 마지막 임시 브랜치에서 다른 브랜치로 체크아웃
+LAST_INDEX=$((${#TEMP_BRANCHES[@]} - 1))
+LAST_TEMP_BRANCH="${TEMP_BRANCHES[$LAST_INDEX]}"
+LAST_FINAL_BRANCH="${FINAL_BRANCHES[$LAST_INDEX]}"
+
+for i in "${!TEMP_BRANCHES[@]}"; do
+  TEMP_BR="${TEMP_BRANCHES[$i]}"
+  FINAL_BR="${FINAL_BRANCHES[$i]}"
+  
+  echo -e "${BLUE}   ${TEMP_BR} → ${FINAL_BR}${NC}"
+  
+  # 현재 브랜치가 rename 대상이면 먼저 다른 곳으로 이동
+  CURRENT=$(git rev-parse --abbrev-ref HEAD)
+  if [ "$CURRENT" = "$TEMP_BR" ]; then
+    # 임시로 detached HEAD 상태로 전환
+    git checkout --detach HEAD 2>/dev/null || true
+  fi
+  
+  rename_temp_to_final "$TEMP_BR" "$FINAL_BR"
+done
+
+# 마지막 브랜치로 체크아웃
+git checkout "$LAST_FINAL_BRANCH" 2>/dev/null || true
+
+# 결과 요약
+echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}✅ Re-stack 완료!${NC}"
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+# 생성된 브랜치 목록 출력
+echo -e "\n${GREEN}📚 생성된 브랜치 목록:${NC}"
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+for branch in "${FINAL_BRANCHES[@]}"; do
+  COMMIT_MSG=$(git log -1 --format="%s" "${branch}" 2>/dev/null || echo "")
+  COMMIT_SHORT=$(git log -1 --format="%h" "${branch}" 2>/dev/null || echo "")
+  echo -e "${CYAN}  ${branch}${NC} (${COMMIT_SHORT}) - ${COMMIT_MSG:0:50}"
+done
+
+# 현재 브랜치 확인
+FINAL_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+echo -e "\n${BLUE}📌 현재 브랜치: ${FINAL_BRANCH}${NC}"
+
+# 푸시 여부 확인
+echo -e "\n${YELLOW}💡 생성된 모든 브랜치를 원격에 푸시하시겠습니까? (y/n)${NC}"
+read -p "선택: " push_choice
+
+if [ "$push_choice" = "y" ] || [ "$push_choice" = "Y" ]; then
+  echo -e "${BLUE}🚀 모든 브랜치 푸시 중...${NC}"
+  for branch in "${FINAL_BRANCHES[@]}"; do
+    echo -e "${BLUE}  푸시 중: ${branch}...${NC}"
+    git push origin "${branch}" --force-with-lease || {
+      echo -e "${RED}  ❌ ${branch} 푸시 실패${NC}"
+    }
+  done
+  echo -e "${GREEN}✅ 모든 브랜치 푸시 완료!${NC}"
+else
+  echo -e "${YELLOW}⏭️  푸시를 건너뜁니다.${NC}"
+fi
+
+echo -e "\n${GREEN}🎉 Re-stack 작업 완료!${NC}"
