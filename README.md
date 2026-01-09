@@ -17,12 +17,6 @@ Git 커밋을 PR 단위로 재정렬하는 CLI 도구입니다.
 ## 설치
 
 ```bash
-npm install -g restack
-```
-
-또는
-
-```bash
 git clone https://github.com/uglyus-daniel/restack-cli.git
 cd restack-cli
 npm link
