@@ -188,8 +188,7 @@ fi
 echo -e "\n${BLUE}🚀 Re-stack 시작...${NC}"
 echo -e "${YELLOW}💡 임시 브랜치 prefix: ${TEMP_PREFIX}${NC}"
 
-PREVIOUS_TEMP_BRANCH=""
-declare -a TEMP_BRANCHES=()
+PREVIOUS_BRANCH=""
 declare -a FINAL_BRANCHES=()
 PR_START_INDEX=0
 
@@ -217,8 +216,8 @@ for pr_idx in "${!PR_BRANCHES[@]}"; do
       exit 1
     }
   else
-    echo -e "${BLUE}   ${PREVIOUS_TEMP_BRANCH}에서 ${TEMP_BRANCH_NAME} 생성...${NC}"
-    git checkout -b "$TEMP_BRANCH_NAME" "$PREVIOUS_TEMP_BRANCH" || {
+    echo -e "${BLUE}   ${PREVIOUS_BRANCH}에서 ${TEMP_BRANCH_NAME} 생성...${NC}"
+    git checkout -b "$TEMP_BRANCH_NAME" "$PREVIOUS_BRANCH" || {
       echo -e "${RED}❌ 브랜치 생성 실패${NC}"
       exit 1
     }
@@ -274,15 +273,22 @@ for pr_idx in "${!PR_BRANCHES[@]}"; do
             echo -e "${YELLOW}🛑 전체 작업 중단 중...${NC}"
             git cherry-pick --abort 2>/dev/null || true
             
-            # 생성된 임시 브랜치들 정리
+            # 현재 임시 브랜치 정리
             echo -e "${YELLOW}🧹 임시 브랜치 정리 중...${NC}"
             git checkout "${CURRENT_BRANCH}" 2>/dev/null || git checkout "$BASE_BRANCH" || true
-            for temp_br in "${TEMP_BRANCHES[@]}"; do
-              git branch -D "$temp_br" 2>/dev/null || true
-            done
             git branch -D "$TEMP_BRANCH_NAME" 2>/dev/null || true
             
-            echo -e "${RED}❌ 작업이 중단되었습니다.${NC}"
+            # 재시작 안내
+            FAILED_COMMIT="${ALL_COMMITS[$PR_START_INDEX]}"
+            FAILED_COMMIT_SHORT=$(git rev-parse --short "$FAILED_COMMIT")
+            if [ ${#FINAL_BRANCHES[@]} -gt 0 ]; then
+              LAST_SUCCESS_BRANCH="${FINAL_BRANCHES[${#FINAL_BRANCHES[@]}-1]}"
+            else
+              LAST_SUCCESS_BRANCH="$BASE_BRANCH"
+            fi
+            echo -e "\n${RED}❌ 작업이 중단되었습니다.${NC}"
+            echo -e "\n${YELLOW}💡 다시 시작하려면 다음 명령어를 실행하세요:${NC}"
+            echo -e "${CYAN}   restack ${FAILED_COMMIT_SHORT} ${END_COMMIT} ${LAST_SUCCESS_BRANCH}${NC}"
             exit 1
             ;;
           *)
@@ -299,45 +305,42 @@ for pr_idx in "${!PR_BRANCHES[@]}"; do
     echo -e "\n${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "${RED}❌ 타입 검사 실패로 작업이 중단되었습니다.${NC}"
     echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}💡 현재 브랜치: ${TEMP_BRANCH_NAME}${NC}"
-    echo -e "${YELLOW}💡 타입 오류를 수정한 후 다시 시도하세요.${NC}"
+    
+    # 현재 임시 브랜치 정리
+    echo -e "${YELLOW}🧹 임시 브랜치 정리 중...${NC}"
+    git checkout "${CURRENT_BRANCH}" 2>/dev/null || git checkout "$BASE_BRANCH" || true
+    git branch -D "$TEMP_BRANCH_NAME" 2>/dev/null || true
+    
+    # 재시작 안내
+    FAILED_COMMIT="${ALL_COMMITS[$PR_START_INDEX]}"
+    FAILED_COMMIT_SHORT=$(git rev-parse --short "$FAILED_COMMIT")
+    if [ ${#FINAL_BRANCHES[@]} -gt 0 ]; then
+      LAST_SUCCESS_BRANCH="${FINAL_BRANCHES[${#FINAL_BRANCHES[@]}-1]}"
+    else
+      LAST_SUCCESS_BRANCH="$BASE_BRANCH"
+    fi
+    echo -e "\n${YELLOW}💡 다시 시작하려면 다음 명령어를 실행하세요:${NC}"
+    echo -e "${CYAN}   restack ${FAILED_COMMIT_SHORT} ${END_COMMIT} ${LAST_SUCCESS_BRANCH}${NC}"
+    echo -e "${YELLOW}💡 타입 오류를 수정한 커밋으로 시작해야 합니다.${NC}"
     exit 1
   fi
   
-  TEMP_BRANCHES+=("$TEMP_BRANCH_NAME")
-  FINAL_BRANCHES+=("$FINAL_BRANCH_NAME")
-  PREVIOUS_TEMP_BRANCH="$TEMP_BRANCH_NAME"
-  PR_START_INDEX=$((PR_END_INDEX + 1))
-done
-
-# 모든 작업 완료 - 임시 브랜치를 최종 브랜치로 rename
-echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${BLUE}🔄 임시 브랜치를 최종 브랜치로 변환 중...${NC}"
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-# 마지막 임시 브랜치에서 다른 브랜치로 체크아웃
-LAST_INDEX=$((${#TEMP_BRANCHES[@]} - 1))
-LAST_TEMP_BRANCH="${TEMP_BRANCHES[$LAST_INDEX]}"
-LAST_FINAL_BRANCH="${FINAL_BRANCHES[$LAST_INDEX]}"
-
-for i in "${!TEMP_BRANCHES[@]}"; do
-  TEMP_BR="${TEMP_BRANCHES[$i]}"
-  FINAL_BR="${FINAL_BRANCHES[$i]}"
-  
-  echo -e "${BLUE}   ${TEMP_BR} → ${FINAL_BR}${NC}"
+  # 타입 검사 통과 - 즉시 임시 브랜치를 최종 브랜치로 rename
+  echo -e "${BLUE}   🔄 ${TEMP_BRANCH_NAME} → ${FINAL_BRANCH_NAME}${NC}"
   
   # 현재 브랜치가 rename 대상이면 먼저 다른 곳으로 이동
   CURRENT=$(git rev-parse --abbrev-ref HEAD)
-  if [ "$CURRENT" = "$TEMP_BR" ]; then
-    # 임시로 detached HEAD 상태로 전환
+  if [ "$CURRENT" = "$TEMP_BRANCH_NAME" ]; then
     git checkout --detach HEAD 2>/dev/null || true
   fi
   
-  rename_temp_to_final "$TEMP_BR" "$FINAL_BR"
+  rename_temp_to_final "$TEMP_BRANCH_NAME" "$FINAL_BRANCH_NAME"
+  git checkout "$FINAL_BRANCH_NAME" 2>/dev/null || true
+  
+  FINAL_BRANCHES+=("$FINAL_BRANCH_NAME")
+  PREVIOUS_BRANCH="$FINAL_BRANCH_NAME"
+  PR_START_INDEX=$((PR_END_INDEX + 1))
 done
-
-# 마지막 브랜치로 체크아웃
-git checkout "$LAST_FINAL_BRANCH" 2>/dev/null || true
 
 # 결과 요약
 echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
